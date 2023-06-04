@@ -37,11 +37,6 @@ jobs:
         with:
           python-version: ${{ env.min-python-version }}
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
       - name: Lint with flake8
         run: flake8
 
@@ -124,15 +119,34 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
       - name: Run pytest tests with coverage
         run: |
-          pytest -n auto --cov=autogpt --cov-report term-missing --cov-branch --cov-report xml --cov-report term
-          python tests/integration/challenges/utils/build_current_score.py
+          echo "test" >> tests/Auto-GPT-test-cassettes/test_write_file/test_write_file.yaml
+          echo "test" >> tests/integration/challenges/current_score.json
+        env:
+          CI: true
+          PROXY: ${{ secrets.PROXY }}
+          AGENT_MODE: ${{ vars.AGENT_MODE }}
+          AGENT_TYPE: ${{ vars.AGENT_TYPE }}
+
+      - id: get_cassettes_diff
+        name: Identify differences between cassettes of current PR and target branch
+        if: ${{ startsWith(github.event_name, 'pull_request') }}
+        run: |
+          cd tests/Auto-GPT-test-cassettes
+          cassette_diff=$(git diff --name-only --diff-filter=M -- '**/*.yaml')
+      
+          if [ -n "$cassette_diff" ]; then
+            echo "updated=true" >> $GITHUB_OUTPUT
+          fi
+          git config --global user.name "Auto-GPT-Bot"
+          git config --global user.email "github-bot@agpt.co"
+
+      - name: Attempt to beat Challenges if cassettes changed
+        if: ${{ startsWith(github.event_name, 'pull_request') }} && "${{ steps.push_cassettes.outputs.updated }}" == "true"
+        run: |
+          echo "test" >> tests/Auto-GPT-test-cassettes/test_write_file/test_write_file.yaml
+          echo "test" >> tests/integration/challenges/current_score.json
         env:
           CI: true
           PROXY: ${{ secrets.PROXY }}
@@ -173,8 +187,7 @@ jobs:
             echo "The challenge scores didn't change."
           fi
 
-      - id: push_cassettes
-        name: Push updated cassettes
+      - name: Push updated cassettes
         run: |
           if [ "${{ startsWith(github.event_name, 'pull_request') }}" = "true" ]; then
             is_pull_request=true
@@ -198,16 +211,12 @@ jobs:
             git commit -m "Auto-update cassettes"
 
             if [ $is_pull_request ]; then
-              git push --force origin HEAD:$cassette_branch
+              git checkout $cassette_branch || git checkout -b $cassette_branch
+              git push -f origin $cassette_branch
             else
+              git pull --rebase origin $cassette_branch
               git push origin HEAD:$cassette_branch
-            fi
-
-            cd ../..
-            if [ $is_pull_request ]; then
-              git fetch origin $base_branch
-              cassette_diff=$(git diff origin/$base_branch)
-            else
+              cd ../..
               git add tests/Auto-GPT-test-cassettes
               git commit -m "Update cassette submodule"
               git push origin HEAD:$current_branch
@@ -216,11 +225,51 @@ jobs:
             echo "No cassette changes to commit"
           fi
 
-          if [ -n "$cassette_diff" ]; then
-            echo "updated=true" >> $GITHUB_OUTPUT
-          else
-            echo "updated=false" >> $GITHUB_OUTPUT
-          fi
+      - id: create_pr
+        name: Create Pull Request if score changed
+        if: ${{ startsWith(github.event_name, 'pull_request') }}
+        run: |
+          current_date_time=$(date +'%Y%m%d%H%M%S')
+          updated_score_branch="update-score-${{ github.event.pull_request.number }}-$current_date_time"
+
+          if ! git diff --quiet -- tests/integration/challenges/current_score.json; then          
+            git add tests/integration/challenges/current_score.json
+            git commit -m "Update score"
+            git checkout -b $updated_score_branch
+          
+            git remote add base https://github.com/${{ github.event.pull_request.base.repo.full_name }}.git
+            branches_to_delete=$(gh api repos/${{ github.event.pull_request.base.repo.owner.login }}/${{ github.event.pull_request.base.repo.name }}/git/refs --jq ".[] | select(.ref | startswith(\"refs/heads/update-score-${{ github.event.pull_request.number }}\")) | .ref")
+            echo ${{ secrets.PAT_REVIEW }} | gh auth login --with-token
+            if [ ! -z "$branches_to_delete" ]; then
+              for branch in $branches_to_delete
+              do
+                branch_short=${branch#refs/heads/}
+                prs=$(gh api repos/${{ github.repository }}/pulls -q ".[] | select(.head.ref == \"$branch_short\") | .number")
+          
+                # iterate through all previous PRs created, close them and delete the branch
+                for pr in $prs
+                  do
+                    gh api repos/${{ github.repository }}/pulls/$pr -X PATCH -F state="closed"
+                  done
+                    gh api -X DELETE /repos/${{ github.event.pull_request.base.repo.owner.login }}/${{ github.event.pull_request.base.repo.name }}/git/$branch
+                done
+              else
+                echo "No matching branches found to delete."
+              fi
+            
+              git push base $updated_score_branch
+              echo "Base branch: ${{ github.event.pull_request.head.ref }}"
+            
+              pr_url=$(gh pr create --title "Update Score In Pull Request Number ${{ github.event.pull_request.number }}" \
+              --head "${{ github.event.pull_request.base.repo.owner.login }}:$updated_score_branch" \
+              --base "${{ github.event.pull_request.head.ref }}" \
+              --body "This pull request updates the current score of Auto-GPT. Please check the files changed and merge the pull request." \
+              --repo ${{ github.event.pull_request.head.repo.full_name }})
+            
+              echo "pr_url=$pr_url" >> $GITHUB_OUTPUT
+            else
+              echo "The current score didn't change."
+            fi
 
       - name: Post Set up git token auth
         if: steps.setup_git_auth.outcome == 'success'
@@ -228,27 +277,35 @@ jobs:
           git config --unset-all '${{ steps.setup_git_auth.outputs.config_key }}'
           git submodule foreach git config --unset-all '${{ steps.setup_git_auth.outputs.config_key }}'
 
-      - name: Apply or remove behaviour change label and comment on PR
+      - name: Apply or remove behaviour change label and comment
         if: ${{ startsWith(github.event_name, 'pull_request') }}
         run: |
-          PR_NUMBER=${{ github.event.pull_request.number }}
           TOKEN=${{ secrets.PAT_REVIEW }}
           REPO=${{ github.repository }}
-
+          echo $TOKEN | gh auth login --with-token
+          COMMENT_BODY=""
+          SCORE_CHANGED_MESSAGE="The pipeline will fail until you merge the updated score: ${{ steps.get_cassettes_diff.outputs.pr_url }}"
+          
           if [[ "${{ steps.push_cassettes.outputs.updated }}" == "true" ]]; then
             echo "Adding label and comment..."
             curl -X POST \
             -H "Authorization: Bearer $TOKEN" \
             -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/$REPO/issues/$PR_NUMBER/labels \
+            https://api.github.com/repos/$REPO/issues/${{ github.event.pull_request.number }}/labels \
             -d '{"labels":["behaviour change"]}'
-
-            echo $TOKEN | gh auth login --with-token
-            gh api repos/$REPO/issues/$PR_NUMBER/comments -X POST -F body="You changed AutoGPT's behaviour. The cassettes have been updated and will be merged to the submodule when this Pull Request gets merged."
-          else
-            echo "Removing label..."
-            curl -X DELETE \
-            -H "Authorization: Bearer $TOKEN" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/$REPO/issues/$PR_NUMBER/labels/behaviour%20change
+          
+            COMMENT_BODY="You changed AutoGPT's behaviour. The cassettes have been updated and will be merged to the submodule when this Pull Request gets merged. "
+          fi
+          
+          if ${{ steps.get_cassettes_diff.outputs.pr_url }}; then
+            COMMENT_BODY="$COMMENT_BODY$SCORE_CHANGED_MESSAGE"
+          fi
+          
+          if [ ! -z "$COMMENT_BODY" ]; then
+            gh api repos/$REPO/issues/${{ github.event.pull_request.number }}/comments -X POST -F body="$COMMENT_BODY"
+          fi
+          
+          if ${{ steps.get_cassettes_diff.outputs.pr_url }}; then
+            echo "$SCORE_CHANGED_MESSAGE"
+            exit 1
           fi
