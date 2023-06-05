@@ -259,7 +259,7 @@ jobs:
           
           if ! git diff --quiet -- tests/integration/challenges/current_score.json; then                      
             pr_url=$(gh pr create --title "Update Score In Pull Request Number ${{ github.event.pull_request.number }}" \
-            --head "${{ github.event.pull_request.base.repo.owner.login }}:"update-score-${{ github.event.pull_request.number }}-$(date +'%Y%m%d%H%M%S')" \
+            --head "${{ github.event.pull_request.base.repo.owner.login }}:update-score-${{ github.event.pull_request.number }}-$(date +'%Y%m%d%H%M%S')" \
             --base "${{ github.event.pull_request.head.ref }}" \
             --body "This pull request updates the current score of Auto-GPT. Please check the files changed and merge the pull request." \
             --repo ${{ github.event.pull_request.head.repo.full_name }})
