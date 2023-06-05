@@ -209,6 +209,7 @@ jobs:
               git push base_repo $updated_score_branch
             else
               git push origin HEAD:${{ github.ref }}
+            fi
           else
             echo "The challenge scores didn't change."
           fi
